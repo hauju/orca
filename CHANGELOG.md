@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A busy agent is no longer reported as unreachable mid-deploy.** The agent answered the master's 30s `StatusPing` inline in its WebSocket read loop, and that report walks every container through two stats samples 500ms apart — about 18s on a node running thirty containers. A `Deploy` sent behind such a ping sat unread past the 10s receipt-ACK window, the master killed the session as dead, and the CLI reported `did not acknowledge deploy ... node is unreachable` while the agent went on to deploy successfully seconds later (14 of 123 deploys over two weeks on one node). The ping is now answered from a spawned task, so the read loop only dispatches; and the master no longer takes a missed ACK as proof of death while the node's heartbeats are fresher than the read-idle deadline — it keeps waiting, bounded by the completion budget, and tears the session down only once the agent has gone silent as well. (mighty840/orca#170)
+
 ## [0.2.12] - 2026-07-21
 
 ### Added

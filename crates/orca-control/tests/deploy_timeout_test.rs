@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 use orca_control::state::{AppState, RegisteredNode};
 use orca_core::config::{ClusterConfig, ServiceConfig};
@@ -93,24 +94,40 @@ async fn register_node(state: &AppState, node_id: u64) {
     );
 }
 
-/// When the agent is connected but never acknowledges receipt, the deploy must
-/// fail with a distinct "did not acknowledge / unreachable" message after the
-/// short ACK window — NOT the old opaque "timed out after 30 s".
+/// Backdate a node's heartbeat past the read-idle deadline: an agent that has
+/// gone silent, as opposed to one that is merely busy.
+async fn silence_node(state: &AppState, node_id: u64) {
+    let idle = state.cluster_config.deploy.ws_idle_timeout_secs as i64;
+    if let Some(node) = state.registered_nodes.write().await.get_mut(&node_id) {
+        node.last_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(idle + 1);
+    }
+}
+
+/// Install a WS session for a node and return the master->agent receiver.
+async fn connect_session(state: &AppState, node_id: u64) -> mpsc::Receiver<MasterMessage> {
+    let (tx, rx) = mpsc::channel::<MasterMessage>(8);
+    state
+        .ws_agents
+        .write()
+        .await
+        .insert(node_id, orca_control::state::AgentSession::new(tx));
+    rx
+}
+
+/// When a silent agent never acknowledges receipt, the deploy must fail with
+/// a distinct "did not acknowledge / unreachable" message after the short ACK
+/// window — NOT the old opaque "timed out after 30 s".
 #[tokio::test]
 async fn ack_timeout_reports_unreachable_distinctly() {
     let mut cfg = ClusterConfig::default();
     cfg.deploy.ack_timeout_secs = 1; // keep the test fast
     let state = make_state(cfg);
     register_node(&state, 1).await;
+    silence_node(&state, 1).await;
 
-    // Register a WS sender whose receiver we hold open, so the Deploy send
-    // succeeds but nothing ever replies with DeployReceived.
-    let (tx, _rx) = tokio::sync::mpsc::channel::<MasterMessage>(8);
-    state
-        .ws_agents
-        .write()
-        .await
-        .insert(1, orca_control::state::AgentSession::new(tx));
+    // Hold the receiver open, so the Deploy send succeeds but nothing ever
+    // replies with DeployReceived.
+    let _rx = connect_session(&state, 1).await;
 
     let cfg = config_placed_on("svc", "1");
     let (deployed, errors) = orca_control::reconciler::reconcile(&state, &[cfg]).await;
@@ -149,19 +166,107 @@ async fn ack_timeout_reports_unreachable_distinctly() {
     }
 }
 
+/// An agent that misses the ACK window but is still heartbeating is busy, not
+/// gone: its session must survive, the master must keep waiting, and the
+/// deploy must succeed once the agent catches up. This was the production
+/// failure — a slow inline handler on the agent delayed the ACK by ~18s while
+/// heartbeats kept flowing, and the master killed the session and reported a
+/// deploy as failed that then completed.
+#[tokio::test]
+async fn heartbeating_agent_is_waited_for_not_killed() {
+    let mut cfg = ClusterConfig::default();
+    cfg.deploy.ack_timeout_secs = 1;
+    let state = make_state(cfg);
+    register_node(&state, 1).await; // heartbeat: now
+    let mut rx = connect_session(&state, 1).await;
+
+    let cfg = config_placed_on("svc", "1");
+    let state_c = state.clone();
+    let deploy =
+        tokio::spawn(async move { orca_control::reconciler::reconcile(&state_c, &[cfg]).await });
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("master should send a Deploy")
+        .expect("channel open");
+    assert!(matches!(msg, MasterMessage::Deploy { .. }));
+
+    // Two ACK windows pass without an ACK.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        state.ws_agents.read().await.contains_key(&1),
+        "a heartbeating agent's session must not be killed on a missed ACK"
+    );
+    assert!(
+        state.pending_deploy_acks.read().await.contains_key("svc"),
+        "the master must still be waiting for the ACK"
+    );
+
+    // The agent catches up: receipt, then a successful result.
+    state
+        .pending_deploy_acks
+        .write()
+        .await
+        .remove("svc")
+        .expect("ack waiter registered")
+        .send(())
+        .ok();
+    state
+        .pending_deploys
+        .write()
+        .await
+        .remove("svc")
+        .expect("result waiter registered")
+        .send(Ok(()))
+        .ok();
+
+    let (deployed, errors) = deploy.await.unwrap();
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    assert!(
+        deployed.contains(&"svc".to_string()),
+        "the late-acknowledged deploy must count as deployed"
+    );
+}
+
+/// The wait for a busy agent is bounded by the completion budget, and running
+/// out of it is a timeout on a live session — not grounds to kill it.
+#[tokio::test]
+async fn heartbeating_agent_that_never_acks_times_out_without_a_kill() {
+    let mut cfg = ClusterConfig::default();
+    cfg.deploy.ack_timeout_secs = 1;
+    cfg.deploy.completion_timeout_secs = 2;
+    let state = make_state(cfg);
+    register_node(&state, 1).await;
+    let _rx = connect_session(&state, 1).await;
+
+    let cfg = config_placed_on("svc", "1");
+    let (deployed, errors) = orca_control::reconciler::reconcile(&state, &[cfg]).await;
+
+    assert!(deployed.is_empty());
+    assert_eq!(errors.len(), 1, "expected one error, got {errors:?}");
+    let err = &errors[0];
+    assert!(
+        err.contains("heartbeating") && err.contains("timed out"),
+        "expected a live-but-unresponsive message, got: {err}"
+    );
+    assert!(
+        !err.contains("unreachable"),
+        "a heartbeating agent must not be reported unreachable: {err}"
+    );
+    assert!(
+        state.ws_agents.read().await.contains_key(&1),
+        "the live session must survive the timeout"
+    );
+    assert!(state.pending_deploy_acks.read().await.is_empty());
+    assert!(state.pending_deploys.read().await.is_empty());
+}
+
 /// Once the agent acknowledges receipt, a real deploy failure (e.g. image not
 /// found) must surface verbatim instead of being masked by a timeout.
 #[tokio::test]
 async fn real_agent_error_propagates_after_ack() {
     let state = make_state(ClusterConfig::default()); // default 10s/600s timeouts
     register_node(&state, 1).await;
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<MasterMessage>(8);
-    state
-        .ws_agents
-        .write()
-        .await
-        .insert(1, orca_control::state::AgentSession::new(tx));
+    let mut rx = connect_session(&state, 1).await;
 
     let cfg = config_placed_on("svc", "1");
     let state_c = state.clone();
@@ -218,12 +323,7 @@ async fn real_agent_error_propagates_after_ack() {
 async fn unchanged_remote_spec_is_not_redispatched() {
     let state = make_state(ClusterConfig::default());
     register_node(&state, 1).await;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<MasterMessage>(8);
-    state
-        .ws_agents
-        .write()
-        .await
-        .insert(1, orca_control::state::AgentSession::new(tx));
+    let mut rx = connect_session(&state, 1).await;
 
     let cfg = config_placed_on("svc", "1");
 
@@ -275,6 +375,10 @@ async fn unchanged_remote_spec_is_not_redispatched() {
         matches!(msg, MasterMessage::Deploy { .. }),
         "expected Deploy, got {msg:?}"
     );
-    drop(rx); // no agent to ack — let the deploy fail; not under test here
+    // No agent to answer, and the node's heartbeat is fresh, so the master
+    // would wait out the completion budget: drop the receipt waiter to end
+    // the deploy now. Its outcome is not under test here.
+    drop(rx);
+    state.pending_deploy_acks.write().await.remove("svc");
     let _ = handle.await;
 }

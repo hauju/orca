@@ -388,9 +388,11 @@ pub(crate) async fn reconcile_service(
 /// an unreachable agent (#88/#94):
 ///
 /// 1. **Receipt ACK** (`deploy.ack_timeout_secs`, default 10s): the agent
-///    confirms it received the command and started work. A miss here means the
-///    WS session is dead / the agent is unreachable — fail fast with a clear
-///    message.
+///    confirms it received the command and started work. A miss from a
+///    *silent* agent (no heartbeat within `ws_idle_timeout_secs`) means the
+///    session is dead — fail fast with a clear message. A miss from an agent
+///    that is still heartbeating means its read loop is busy, not gone: the
+///    wait continues, bounded by the completion budget below.
 /// 2. **Completion** (`deploy.completion_timeout_secs`, default 600s): the
 ///    agent reports the deploy finished. Long enough to cover multi-GB
 ///    first-time pulls. On a real failure the agent's pull error surfaces
@@ -443,28 +445,59 @@ async fn queue_remote_deploy(
     // Phase 1: receipt ACK — distinguishes a dead/unreachable agent from a
     // slow pull. This is the failure mode that used to masquerade as the
     // misleading "is `orca server` running?" timeout.
-    match tokio::time::timeout(ack_timeout, ack_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            clear_pending_deploy(state, &spec.name).await;
-            anyhow::bail!("deploy receipt channel dropped for agent {node_id}");
+    //
+    // A missed ACK alone is not proof the session is dead: the agent reads
+    // commands sequentially, so a slow handler ahead of the Deploy delays
+    // the ACK past the window while the agent's heartbeat task keeps the
+    // socket demonstrably alive. Killing such a session reported deploys as
+    // failed that then succeeded seconds later (mighty840/orca#170). So: keep waiting
+    // while the node's heartbeat is fresher than the read-idle deadline —
+    // the session loop's own definition of "alive" — and tear the session
+    // down only once the agent has gone silent as well.
+    let idle = Duration::from_secs(state.cluster_config.deploy.ws_idle_timeout_secs);
+    let waited = std::time::Instant::now();
+    let mut ack_rx = ack_rx;
+    loop {
+        match tokio::time::timeout(ack_timeout, &mut ack_rx).await {
+            Ok(Ok(())) => break,
+            Ok(Err(_)) => {
+                clear_pending_deploy(state, &spec.name).await;
+                anyhow::bail!("deploy receipt channel dropped for agent {node_id}");
+            }
+            Err(_) => {}
         }
-        Err(_) => {
-            clear_pending_deploy(state, &spec.name).await;
-            // A missed receipt-ACK is proof the control session is dead
-            // (#131): the agent ACKs instantly when the channel works. Tear
-            // the session down so the node stops looking reachable and
-            // subsequent deploys fail fast with the real story — instead of
-            // every deploy re-timing-out against the same zombie tx for
-            // days. The agent's own idle deadline triggers its reconnect;
-            // a truly-gone node is stale-pruned 60s later.
-            crate::ws_handler::kill_agent_session(state, node_id, "deploy ACK timeout").await;
-            anyhow::bail!(
-                "agent {node_id} did not acknowledge deploy of {} within {}s — control                  session closed; node is unreachable until it rejoins",
+        let alive = state
+            .heartbeat_age(node_id)
+            .await
+            .is_some_and(|age| age < idle);
+        if alive && waited.elapsed() < completion_timeout {
+            info!(
+                "agent {node_id} is heartbeating but has not acknowledged deploy of {} after {}s — waiting",
                 spec.name,
-                ack_timeout.as_secs()
+                waited.elapsed().as_secs()
+            );
+            continue;
+        }
+        clear_pending_deploy(state, &spec.name).await;
+        if alive {
+            anyhow::bail!(
+                "agent {node_id} is heartbeating but its acknowledgement of deploy of {} timed out after {}s — the command may be queued behind a long-running one on the agent",
+                spec.name,
+                completion_timeout.as_secs()
             );
         }
+        // A silent agent: now the missed ACK is proof the control session
+        // is dead (#131). Tear it down so the node stops looking reachable
+        // and subsequent deploys fail fast with the real story — instead of
+        // every deploy re-timing-out against the same zombie tx for days.
+        // The agent's own idle deadline triggers its reconnect; a truly-gone
+        // node is stale-pruned 60s later.
+        crate::ws_handler::kill_agent_session(state, node_id, "deploy ACK timeout").await;
+        anyhow::bail!(
+            "agent {node_id} did not acknowledge deploy of {} within {}s — control session closed; node is unreachable until it rejoins",
+            spec.name,
+            ack_timeout.as_secs()
+        );
     }
 
     // Phase 2: completion — long enough for multi-GB first-time pulls. The
