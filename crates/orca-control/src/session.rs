@@ -55,6 +55,15 @@ impl AppState {
             .map(|s| s.tx.clone())
     }
 
+    /// Time since the node's last heartbeat, or `None` for an unknown node.
+    /// A fresh value proves the control session is alive even while a
+    /// command to the agent goes unanswered: the agent is busy, not gone.
+    pub async fn heartbeat_age(&self, node_id: u64) -> Option<std::time::Duration> {
+        let nodes = self.registered_nodes.read().await;
+        let last = nodes.get(&node_id)?.last_heartbeat;
+        Some((chrono::Utc::now() - last).to_std().unwrap_or_default())
+    }
+
     /// Deregister a session's map entry iff it still owns it (#131).
     /// Returns whether the caller was the owner — a superseded session
     /// exiting late gets `false` and must not touch its replacement's

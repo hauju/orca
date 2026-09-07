@@ -16,6 +16,9 @@ mod deploy;
 mod logs;
 pub mod network_status;
 mod reconcile;
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,7 +198,7 @@ async fn handle_master_message(
     domain_tx: &mpsc::Sender<(String, String, u16)>,
     out_tx: &mpsc::Sender<AgentMessage>,
     exec_sessions: &ExecSessions,
-    stats_collector: &crate::host_stats::HostStatsCollector,
+    stats_collector: &Arc<crate::host_stats::HostStatsCollector>,
 ) -> anyhow::Result<()> {
     let msg: MasterMessage = serde_json::from_str(text)?;
 
@@ -303,24 +306,22 @@ async fn handle_master_message(
             crate::ws_exec::close(&session_id, exec_sessions).await;
         }
         MasterMessage::StatusPing => {
-            let workloads = agent.collect_workload_reports(runtime.as_ref()).await;
-            let sample = stats_collector.sample();
-            let _ = out_tx
-                .send(AgentMessage::Heartbeat {
-                    node_id,
-                    workloads,
-                    stats: HostStats {
-                        cpu_percent: sample.cpu_percent,
-                        memory_bytes: sample.memory_bytes,
-                        memory_total: sample.memory_total,
-                        disk_used: sample.disk_used,
-                        disk_total: sample.disk_total,
-                        net_rx: sample.net_rx,
-                        net_tx: sample.net_tx,
-                        domains: vec![],
-                    },
-                })
-                .await;
+            // Spawned, never inline: the report walks every workload through
+            // the runtime, two stats samples 500ms apart per container, which
+            // on a node running thirty containers keeps this loop from
+            // reading its next frame for ~18s. A Deploy queued behind the
+            // ping sat unread past the master's 10s receipt-ACK window and
+            // was reported as an unreachable agent while the container came
+            // up fine (mighty840/orca#170).
+            let rt = runtime.clone();
+            let agent_c = agent.clone();
+            let stats_c = stats_collector.clone();
+            let tx = out_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(build_heartbeat(node_id, &rt, &agent_c, &stats_c).await)
+                    .await;
+            });
         }
         MasterMessage::PruneSystem => {
             info!("WS: prune system requested by master");

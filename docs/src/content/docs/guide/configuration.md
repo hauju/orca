@@ -54,7 +54,7 @@ reconciliation. Defaults shown:
 
 ```toml
 [deploy]
-ack_timeout_secs = 10          # agent must acknowledge a deploy within this, else "unreachable"
+ack_timeout_secs = 10          # a silent agent must acknowledge a deploy within this, else "unreachable"; a heartbeating one is waited for
 completion_timeout_secs = 600  # time for the agent to pull the image + start (covers multi-GB pulls)
 adopt_orphans = true           # adopt orca.managed containers running on an agent but missing from the registry
 adopt_interval_secs = 30       # how often to scan agents for orphans

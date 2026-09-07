@@ -147,6 +147,9 @@ async fn remote_deploy_without_ack_is_not_redeployed_every_cycle() {
     );
 
     // Node "node-7" + an agent that is connected but never acks (rx held open).
+    // Its heartbeat is stale as well: a silent agent fails the ACK window
+    // fast, whereas a heartbeating one is waited for (mighty840/orca#170).
+    let idle_secs = state.cluster_config.deploy.ws_idle_timeout_secs as i64;
     state.registered_nodes.write().await.insert(
         7,
         RegisteredNode {
@@ -154,7 +157,7 @@ async fn remote_deploy_without_ack_is_not_redeployed_every_cycle() {
             node_id: 7,
             address: "node-7:6881".into(),
             labels: HashMap::new(),
-            last_heartbeat: chrono::Utc::now(),
+            last_heartbeat: chrono::Utc::now() - chrono::Duration::seconds(idle_secs + 1),
             drain: false,
             cpu_percent: 0.0,
             memory_bytes: 0,
