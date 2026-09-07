@@ -39,6 +39,9 @@ pub struct MockRuntime {
     counter: Arc<Mutex<u64>>,
     /// If set, the mock host port returned by resolve_host_port.
     pub mock_host_port: Option<u16>,
+    /// Latency added to every `status` call, to model a runtime that is slow
+    /// to answer (a Docker daemon walking thirty containers).
+    pub status_delay: Duration,
 }
 
 impl MockRuntime {
@@ -49,6 +52,7 @@ impl MockRuntime {
             statuses: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(Mutex::new(0)),
             mock_host_port: None,
+            status_delay: Duration::ZERO,
         }
     }
 
@@ -139,6 +143,9 @@ impl Runtime for MockRuntime {
     }
 
     async fn status(&self, handle: &WorkloadHandle) -> Result<WorkloadStatus> {
+        if !self.status_delay.is_zero() {
+            tokio::time::sleep(self.status_delay).await;
+        }
         let statuses = self.statuses.lock().await;
         statuses
             .get(&handle.runtime_id)
