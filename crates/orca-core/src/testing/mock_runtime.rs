@@ -39,6 +39,9 @@ pub struct MockRuntime {
     counter: Arc<Mutex<u64>>,
     /// If set, the mock host port returned by resolve_host_port.
     pub mock_host_port: Option<u16>,
+    /// If set, `stats` sleeps this long first — models the Docker runtime,
+    /// which spends ~0.75s per container taking two samples.
+    pub stats_delay: Option<Duration>,
 }
 
 impl MockRuntime {
@@ -49,6 +52,7 @@ impl MockRuntime {
             statuses: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(Mutex::new(0)),
             mock_host_port: None,
+            stats_delay: None,
         }
     }
 
@@ -163,6 +167,9 @@ impl Runtime for MockRuntime {
     }
 
     async fn stats(&self, _handle: &WorkloadHandle) -> Result<ResourceStats> {
+        if let Some(delay) = self.stats_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(ResourceStats {
             cpu_percent: 0.0,
             memory_bytes: 0,
